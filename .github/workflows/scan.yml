@@ -3,7 +3,7 @@ name: Nifty Hourly Scanner
 on:
   workflow_dispatch: {}
   schedule:
-    # Likely hourly closes (IST) Mon–Fri. We trigger at :50 UTC-offset to allow bar to finalize.
+    # Likely hourly closes (IST) Mon–Fri. Trigger ~:50 (UTC offsets) so the bar is finalized.
     - cron: "50 4 * * 1-5"
     - cron: "50 5 * * 1-5"
     - cron: "50 6 * * 1-5"
@@ -37,6 +37,8 @@ jobs:
           OTM_GAP_POINTS: "100"
           ATM_STEP_POINTS: "50"
           LOG_LEVEL: "INFO"
+          # New: Tuesday weekly expiry (override if NSE changes again)
+          EXPIRY_WEEKDAY: "TUE"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
