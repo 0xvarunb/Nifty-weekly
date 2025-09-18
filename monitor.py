@@ -2,22 +2,20 @@
 """
 NIFTY hourly scanner for Supertrend + EMA(20)
 
-Signal rules (at hourly close, IST):
+Signal rules (evaluated on the latest completed hourly candle, IST):
 - Bullish  = Close > Supertrend AND Close > EMA20
 - Bearish  = Close < Supertrend AND Close < EMA20
-Alert only on a NEW flip (from non-bull to bull, or non-bear to bear).
+Alert triggers only on a NEW flip into bull/bear.
 
 Outputs a JSON summary and (optionally) sends a Telegram alert with:
 - Side (BULLISH/BEARISH)
 - Close / Supertrend / EMA20
 - Suggested weekly option legs (ATM sell + OTM hedge)
 - Next weekly expiry date (Thu, IST)
-
-Author: you + ChatGPT
 """
 from __future__ import annotations
 
-import os, sys, json
+import os, sys, json, math
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -28,21 +26,21 @@ import yfinance as yf
 
 from indicators import ema, supertrend
 
-# ---------- Config (override via repo Settings → Secrets → Actions if you like) ----------
+# ---------- Config ----------
 TICKER            = os.getenv("NIFTY_TICKER", "^NSEI")   # Yahoo NIFTY50 index
-INTERVAL          = "60m"                                # hourly bars
+INTERVAL          = "60m"
 LOOKBACK_DAYS     = int(os.getenv("LOOKBACK_DAYS", "60"))
 
 EMA_PERIOD        = int(os.getenv("EMA_PERIOD", "20"))
 ST_ATR_PERIOD     = int(os.getenv("ST_ATR_PERIOD", "7"))
 ST_MULTIPLIER     = float(os.getenv("ST_MULTIPLIER", "3.5"))
 
-OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "100"))  # hedge gap suggestion
-ATM_STEP_POINTS   = int(os.getenv("ATM_STEP_POINTS", "50"))   # NIFTY=50, BANKNIFTY=100
+OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "100"))   # hedge gap suggestion
+ATM_STEP_POINTS   = int(os.getenv("ATM_STEP_POINTS", "50"))    # NIFTY=50, BANKNIFTY=100
 
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO")
 
-# Telegram (optional). Put these in: Repo → Settings → Secrets and variables → Actions
+# Telegram (optional)
 TG_TOKEN          = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM     = bool(TG_TOKEN and TG_CHAT_ID)
@@ -55,14 +53,14 @@ def log(msg: str):
 
 # ---------- Helpers ----------
 def round_to_step(x: float, step: int) -> int:
-    return int(round(x / step) * step)
+    # round to nearest step (e.g., 50 for NIFTY)
+    return int(round(float(x) / float(step)) * step)
 
 def next_weekly_expiry_ist(now_ist: datetime) -> str:
     """ Weekly index options typically expire on Thursday (IST). """
     dow = now_ist.weekday()  # Mon=0..Sun=6
-    days_ahead = (3 - dow) % 7  # 3 = Thursday
+    days_ahead = (3 - dow) % 7  # 3 == Thu
     expiry = (now_ist + timedelta(days=days_ahead)).date()
-    # If already Thu after market close, push to next week
     if dow == 3 and now_ist.time() > dtime(15, 30):
         expiry = (now_ist + timedelta(days=7)).date()
     return str(expiry)
@@ -87,22 +85,31 @@ def suggested_option_legs(side: str, spot: float, now_ist: datetime) -> dict:
     return legs
 
 # ---------- Data & Indicators ----------
+def _force_float_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    return df
+
 def fetch_hourly() -> pd.DataFrame:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=LOOKBACK_DAYS)
     df = yf.download(TICKER, start=start, end=end, interval=INTERVAL, auto_adjust=False, progress=False)
     if df.empty:
-        raise RuntimeError("No data returned from yfinance. Try again later or change ticker.")
+        raise RuntimeError("No data returned from yfinance. Try later or change ticker.")
     if df.index.tz is None:
         df.index = df.index.tz_localize(timezone.utc)
-    return df.tz_convert(IST)
+    df = df.tz_convert(IST)
+    # ensure numeric types
+    df = _force_float_cols(df, ["Open", "High", "Low", "Close", "Adj Close", "Volume"])
+    return df
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["EMA20"] = ema(out["Close"], EMA_PERIOD)
+    out["EMA20"] = ema(out["Close"], EMA_PERIOD).astype("float64")
     st = supertrend(out, period=ST_ATR_PERIOD, multiplier=ST_MULTIPLIER)
-    out["ST"] = st["ST"]
-    out["ST_DIR"] = st["ST_DIR"]
+    out["ST"] = pd.to_numeric(st["ST"], errors="coerce").astype("float64")
+    out["ST_DIR"] = pd.to_numeric(st["ST_DIR"], errors="coerce").astype("int64")
     return out
 
 def latest_hourly_close_row_index(df: pd.DataFrame) -> int | None:
@@ -116,47 +123,63 @@ def latest_hourly_close_row_index(df: pd.DataFrame) -> int | None:
     if ts_last.date() != now_ist.date():
         log(f"Last bar {ts_last} not from today; skipping.")
         return None
-    # close windows vary; accept 10..20 past the hour
-    if not (10 <= ts_last.minute <= 20):
+    # hourly close window tolerance
+    if not (10 <= int(ts_last.minute) <= 20):
         log(f"Last bar minute {ts_last.minute} not in 10..20; skipping (ts={ts_last}).")
         return None
-    if now_ist - ts_last > timedelta(hours=6):
+    if (now_ist - ts_last) > timedelta(hours=6):
         log(f"Last bar {ts_last} stale (>6h); skipping.")
         return None
     return idx_last
 
-# ---------- Signal (SCALAR comparisons only) ----------
+# ---------- Safe scalar extraction ----------
+def _get_scalar(series_like) -> float:
+    """
+    Convert any pandas/NumPy scalar-ish object to a plain Python float.
+    If it's NaN or cannot be converted, raise ValueError.
+    """
+    try:
+        # handle numpy scalar, pandas scalar, or regular float/int
+        val = float(series_like)
+        if math.isnan(val):
+            raise ValueError("NaN")
+        return val
+    except Exception as _:
+        raise ValueError("not a scalar")
+
+# ---------- Signal ----------
 def evaluate_signal(df: pd.DataFrame) -> dict:
     idx_last = latest_hourly_close_row_index(df)
     if idx_last is None:
         return {"status": "NO_ACTION"}
 
-    # Scalars via .iat (avoid Series vs scalar ambiguity)
+    # Scalars via .iat and safe cast
     try:
-        c  = float(df["Close"].iat[idx_last])
-        st = float(df["ST"].iat[idx_last])
-        e  = float(df["EMA20"].iat[idx_last])
-    except Exception:
+        c  = _get_scalar(df["Close"].iat[idx_last])
+        st = _get_scalar(df["ST"].iat[idx_last])
+        e  = _get_scalar(df["EMA20"].iat[idx_last])
+    except ValueError:
         return {"status": "NO_ACTION"}
 
+    pc = pst = pe = np.nan
     if idx_last >= 1:
         try:
-            pc  = float(df["Close"].iat[idx_last-1])
-            pst = float(df["ST"].iat[idx_last-1])
-            pe  = float(df["EMA20"].iat[idx_last-1])
-        except Exception:
+            pc  = _get_scalar(df["Close"].iat[idx_last-1])
+            pst = _get_scalar(df["ST"].iat[idx_last-1])
+            pe  = _get_scalar(df["EMA20"].iat[idx_last-1])
+        except ValueError:
             pc = pst = pe = np.nan
-    else:
-        pc = pst = pe = np.nan
 
+    # Current regime (pure Python bools)
     bull = (c > st) and (c > e)
     bear = (c < st) and (c < e)
 
+    # Prior regime
     bull_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc > pst) and (pc > pe)
     bear_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc < pst) and (pc < pe)
 
-    crossed_to_bull = bool(bull and (not bull_prev))
-    crossed_to_bear = bool(bear and (not bear_prev))
+    crossed_to_bull = bull and (not bull_prev)
+    crossed_to_bear = bear and (not bear_prev)
 
     ts_last: datetime = df.index[idx_last]
     now_ist = datetime.now(IST)
@@ -223,10 +246,15 @@ def main():
     log("Fetching data...")
     df = fetch_hourly()
     log(f"Rows: {len(df)} | Last bar: {df.index[-1]}")
+
     df = compute_indicators(df)
+    # force numeric again just in case
+    df = _force_float_cols(df, ["EMA20", "ST"])
+
     sig = evaluate_signal(df)
 
-    print(json.dumps(sig, indent=2))  # always print JSON for easy parsing/logs
+    # Always print JSON (for logs/consumers)
+    print(json.dumps(sig, indent=2))
 
     if sig.get("status") == "SIGNAL":
         msg = format_signal_text(sig)
