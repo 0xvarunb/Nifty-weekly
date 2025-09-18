@@ -3,18 +3,19 @@
 NIFTY hourly scanner for Supertrend + EMA(20) regime
 - Bullish signal  = Close > Supertrend AND Close > EMA20
 - Bearish signal  = Close < Supertrend AND Close < EMA20
-Runs safely on GitHub Actions. Optional Telegram alerts via secrets.
 
-Signals tell you WHAT to set up:
-  Bullish  -> Sell 1 lot ATM Put, Buy OTM Put as hedge
-  Bearish  -> Sell 1 lot ATM Call, Buy OTM Call as hedge
+Outputs a JSON summary and (optionally) sends a Telegram alert with:
+- Side (BULLISH/BEARISH)
+- Close / Supertrend / EMA20
+- Suggested weekly option legs (ATM sell + OTM hedge)
+- Next weekly expiry date (IST)
 
 Author: you + ChatGPT
 """
 from __future__ import annotations
 
-import os, sys, json, math
-from datetime import datetime, timedelta, timezone
+import os, sys, json
+from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -31,7 +32,8 @@ LOOKBACK_DAYS     = int(os.getenv("LOOKBACK_DAYS", "60"))
 EMA_PERIOD        = int(os.getenv("EMA_PERIOD", "20"))
 ST_ATR_PERIOD     = int(os.getenv("ST_ATR_PERIOD", "7"))
 ST_MULTIPLIER     = float(os.getenv("ST_MULTIPLIER", "3.5"))
-OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "100"))  # hedge gap suggestion
+OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "100"))  # hedge distance suggestion
+ATM_STEP_POINTS   = int(os.getenv("ATM_STEP_POINTS", "50"))   # NIFTY=50, BANKNIFTY=100
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO")
 
 # Telegram (optional). Put these in GitHub repo -> Settings -> Secrets -> Actions
@@ -42,31 +44,47 @@ SEND_TELEGRAM     = bool(TG_TOKEN and TG_CHAT_ID)
 IST = ZoneInfo("Asia/Kolkata")
 
 def log(msg: str):
-    if LOG_LEVEL.upper() == "DEBUG":
-        print(f"[{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}] {msg}", flush=True)
-    else:
-        print(msg, flush=True)
+    prefix = f"[{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}] " if LOG_LEVEL.upper() == "DEBUG" else ""
+    print(prefix + str(msg), flush=True)
 
-def round_to_50(x: float) -> int:
-    return int(round(x / 50.0) * 50)
+# ---------- Helpers ----------
+def round_to_step(x: float, step: int) -> int:
+    return int(round(x / step) * step)
 
-def suggested_option_legs(side: str, spot: float) -> dict:
+def next_weekly_expiry_ist(now_ist: datetime) -> str:
     """
-    For a bullish signal, we suggest: SELL ATM PUT, BUY OTM PUT
-    For a bearish signal, we suggest: SELL ATM CALL, BUY OTM CALL
+    Weekly index options in India typically expire on Thursday.
+    If it's already Thu after market close (15:30), roll to next Thu.
     """
-    atm = round_to_50(spot)
+    dow = now_ist.weekday()  # Mon=0 ... Sun=6
+    days_ahead = (3 - dow) % 7  # 3 = Thu
+    expiry_date = (now_ist + timedelta(days=days_ahead)).date()
+    # If today is Thursday and after market close, push to next week
+    if dow == 3 and now_ist.time() > dtime(15, 30):
+        expiry_date = (now_ist + timedelta(days=7)).date()
+    return str(expiry_date)
+
+def suggested_option_legs(side: str, spot: float, now_ist: datetime) -> dict:
+    """
+    For a bullish signal, suggest: SELL ATM PUT, BUY OTM PUT
+    For a bearish signal, suggest: SELL ATM CALL, BUY OTM CALL
+    Includes next weekly expiry (IST).
+    """
+    atm = round_to_step(spot, ATM_STEP_POINTS)
     if side == "BULL":
-        return {
+        legs = {
             "sell": f"{atm} PE (ATM)",
-            "buy":  f"{max(50, atm - OTM_GAP_POINTS)} PE (hedge ~{OTM_GAP_POINTS})"
+            "buy":  f"{max(ATM_STEP_POINTS, atm - OTM_GAP_POINTS)} PE (hedge ~{OTM_GAP_POINTS})"
         }
     else:
-        return {
+        legs = {
             "sell": f"{atm} CE (ATM)",
             "buy":  f"{atm + OTM_GAP_POINTS} CE (hedge ~{OTM_GAP_POINTS})"
         }
+    legs["expiry"] = next_weekly_expiry_ist(now_ist)
+    return legs
 
+# ---------- Data / Indicators ----------
 def fetch_hourly() -> pd.DataFrame:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=LOOKBACK_DAYS)
@@ -75,7 +93,7 @@ def fetch_hourly() -> pd.DataFrame:
     )
     if df.empty:
         raise RuntimeError("No data returned from yfinance. Try again or change ticker.")
-    # Ensure tz-aware; Yahoo returns tz-aware for intraday. Convert to IST for convenience.
+    # Ensure tz-aware; convert to IST for convenience.
     if df.index.tz is None:
         df.index = df.index.tz_localize(timezone.utc)
     df = df.tz_convert(IST)
@@ -91,65 +109,90 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def latest_hourly_close_row(df: pd.DataFrame) -> pd.Series | None:
     """
-    NSE hourly bars typically close at minute == 15 (10:15, 11:15, ... 15:15 IST).
-    We'll use the last row, but only act if it's a same-day hourly close bar.
+    NSE hourly bars typically close at ~:15 (10:15, 11:15, ... 15:15 IST).
+    We'll use the last row, but only act if it's from today and looks like a close bar.
     """
     last = df.iloc[-1]
     ts: datetime = df.index[-1]
     now_ist = datetime.now(IST)
-    # Only act on same-day bars & when the last bar is not stale.
+
     if ts.date() != now_ist.date():
         log(f"Last bar {ts} not from today; skipping.")
         return None
-    # Accept the bar even if we're checking a bit later (workflow is scheduled).
+
+    # Accept bars that look like closes (10..20 minutes past the hour)
+    if not (10 <= ts.minute <= 20):
+        log(f"Last bar minute {ts.minute} not in 10..20 (ts={ts}); likely mid-bar; skipping.")
+        return None
+
+    # Basic staleness guard
     if now_ist - ts > timedelta(hours=6):
         log(f"Last bar {ts} looks stale (>6h); skipping.")
         return None
-    # Optional strict check for minute==15
-    if ts.minute != 15:
-        log(f"Last bar minute != 15 (ts={ts}); likely mid-bar; skipping.")
-        return None
+
     return last
 
+# ---------- Signal ----------
 def evaluate_signal(df: pd.DataFrame) -> dict:
     last = latest_hourly_close_row(df)
     if last is None:
         return {"status": "NO_ACTION"}
 
+    # Cast to plain floats to avoid ambiguous truth errors
+    try:
+        c  = float(last["Close"])
+        st = float(last["ST"])
+        e  = float(last["EMA20"])
+    except Exception:
+        return {"status": "NO_ACTION"}
+
     prev = df.iloc[-2] if len(df) >= 2 else None
+    if prev is not None:
+        try:
+            pc  = float(prev["Close"])
+            pst = float(prev["ST"])
+            pe  = float(prev["EMA20"])
+        except Exception:
+            pc = pst = pe = np.nan
+    else:
+        pc = pst = pe = np.nan
 
-    bull = (last["Close"] > last["ST"]) and (last["Close"] > last["EMA20"])
-    bear = (last["Close"] < last["ST"]) and (last["Close"] < last["EMA20"])
+    # Current regime (scalars only)
+    bull = (c > st) and (c > e)
+    bear = (c < st) and (c < e)
 
-    # Cross/flip detection (only alert on a NEW regime)
-    bull_prev = prev is not None and (prev["Close"] > prev["ST"]) and (prev["Close"] > prev["EMA20"])
-    bear_prev = prev is not None and (prev["Close"] < prev["ST"]) and (prev["Close"] < prev["EMA20"])
+    # Prior regime (handle NaNs safely)
+    bull_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc > pst) and (pc > pe)
+    bear_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc < pst) and (pc < pe)
 
-    crossed_to_bull = bull and not bull_prev
-    crossed_to_bear = bear and not bear_prev
+    crossed_to_bull = bull and (not bull_prev)
+    crossed_to_bear = bear and (not bear_prev)
 
-    spot = float(last["Close"])
+    spot = c
     ts = df.index[-1]
+    now_ist = datetime.now(IST)
+
     if crossed_to_bull:
-        legs = suggested_option_legs("BULL", spot)
+        legs = suggested_option_legs("BULL", spot, now_ist)
         return {
             "status": "SIGNAL",
             "side": "BULLISH",
             "timestamp": ts.isoformat(),
             "close": spot,
-            "ema20": float(last["EMA20"]),
-            "supertrend": float(last["ST"]),
+            "ema20": e,
+            "supertrend": st,
             "option_legs": legs
         }
+
     if crossed_to_bear:
-        legs = suggested_option_legs("BEAR", spot)
+        legs = suggested_option_legs("BEAR", spot, now_ist)
         return {
             "status": "SIGNAL",
             "side": "BEARISH",
             "timestamp": ts.isoformat(),
             "close": spot,
-            "ema20": float(last["EMA20"]),
-            "supertrend": float(last["ST"]),
+            "ema20": e,
+            "supertrend": st,
             "option_legs": legs
         }
 
@@ -157,10 +200,11 @@ def evaluate_signal(df: pd.DataFrame) -> dict:
         "status": "NO_SIGNAL",
         "timestamp": ts.isoformat(),
         "close": spot,
-        "ema20": float(last["EMA20"]),
-        "supertrend": float(last["ST"])
+        "ema20": e,
+        "supertrend": st
     }
 
+# ---------- Alerts ----------
 def send_telegram(msg: str) -> None:
     if not SEND_TELEGRAM:
         log("Telegram disabled (missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID).")
@@ -176,7 +220,7 @@ def send_telegram(msg: str) -> None:
         log(f"Telegram send failed: {e}")
 
 def format_signal_text(sig: dict) -> str:
-    if sig["status"] != "SIGNAL":
+    if sig.get("status") != "SIGNAL":
         return ""
     side = sig["side"]
     ts_ist = datetime.fromisoformat(sig["timestamp"]).astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
@@ -189,11 +233,13 @@ def format_signal_text(sig: dict) -> str:
         f"Side: {side}\n"
         f"Close: {spot:.2f} | ST: {st:.2f} | EMA20: {ema20:.2f}\n"
         f"Suggested (weekly):\n"
+        f"Expiry: {legs['expiry']}\n"
         f" • SELL {legs['sell']}\n"
         f" • BUY  {legs['buy']}\n"
         f"Exit if Supertrend flips or by Wed EOD/Thu AM."
     )
 
+# ---------- Main ----------
 def main():
     log("Fetching data...")
     df = fetch_hourly()
@@ -201,7 +247,7 @@ def main():
     df = compute_indicators(df)
     sig = evaluate_signal(df)
 
-    # Always print a JSON summary to logs
+    # Always print a JSON summary
     print(json.dumps(sig, indent=2))
 
     # Optional Telegram alert only when a new signal appears
