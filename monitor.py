@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-NIFTY hourly scanner for Supertrend + EMA(20)
+NIFTY hourly scanner for Supertrend + EMA(20) with ENTRY + EXIT (stoploss) alerts.
 
-Signals (evaluated on latest completed hourly candle, IST):
+Signals (evaluated on the latest completed hourly candle, IST):
 - Bullish  = Close > Supertrend AND Close > EMA20
 - Bearish  = Close < Supertrend AND Close < EMA20
-Alert triggers only on a NEW flip into bull/bear.
+ENTRY alerts fire only on a NEW flip into bull/bear.
+EXIT (stoploss) alerts fire when an existing regime ENDS (Supertrend flip).
 
 Outputs JSON and (optionally) sends a Telegram alert with:
 - Side, Close, Supertrend, EMA20
 - Suggested option legs (ATM sell + OTM hedge)
 - Next expiry (Tue-based weekly; monthly = last Tue)
-
-Extras:
-- `--ping` sends a Telegram test message and exits.
-- `HEARTBEAT=1` sends a short daily "alive" ping (used by heartbeat workflow).
+- Clear labels for ENTRY, EXIT, and EXIT & REVERSE.
 """
 from __future__ import annotations
 
@@ -218,7 +216,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ST_DIR"] = pd.to_numeric(st["ST_DIR"], errors="coerce").astype("int64")
     return out
 
-# ---------------- Signal logic ----------------
+# ---------------- Signal logic (with EXIT) ----------------
 def latest_hourly_close_row_index(df: pd.DataFrame) -> int | None:
     idx_last = len(df)-1
     ts_last: datetime = df.index[idx_last]
@@ -239,10 +237,19 @@ def _get_scalar(x) -> float:
     except Exception:
         raise ValueError("not scalar")
 
-def evaluate_signal(df: pd.DataFrame) -> dict:
+def evaluate_with_exit(df: pd.DataFrame) -> dict:
+    """
+    Returns one of:
+      - {"status":"ENTRY", "side":"BULLISH"/"BEARISH", ...}
+      - {"status":"EXIT",  "from_side":"BULLISH"/"BEARISH", "reason":"Trend flip", ...}
+      - {"status":"EXIT_AND_REVERSE", "from_side":..., "to_side":..., "entry_suggestion":{legs}, ...}
+      - {"status":"NO_ACTION", ...} or {"status":"NO_SIGNAL", ...}
+    """
     idx_last = latest_hourly_close_row_index(df)
     if idx_last is None:
         return {"status": "NO_ACTION"}
+
+    # current bar
     try:
         c  = _get_scalar(df["Close"].iat[idx_last])
         st = _get_scalar(df["ST"].iat[idx_last])
@@ -250,34 +257,72 @@ def evaluate_signal(df: pd.DataFrame) -> dict:
     except ValueError:
         return {"status": "NO_ACTION"}
 
-    pc=pst=pe=np.nan
-    if idx_last>=1:
+    # previous bar
+    pc = pst = pe = np.nan
+    if idx_last >= 1:
         try:
             pc  = _get_scalar(df["Close"].iat[idx_last-1])
             pst = _get_scalar(df["ST"].iat[idx_last-1])
             pe  = _get_scalar(df["EMA20"].iat[idx_last-1])
         except ValueError:
-            pc=pst=pe=np.nan
+            pc = pst = pe = np.nan
 
-    bull = (c>st) and (c>e)
-    bear = (c<st) and (c<e)
-
-    bull_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc>pst) and (pc>pe)
-    bear_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc<pst) and (pc<pe)
-
-    crossed_to_bull = bull and (not bull_prev)
-    crossed_to_bear = bear and (not bear_prev)
+    # regimes
+    bull     = (c > st) and (c > e)
+    bear     = (c < st) and (c < e)
+    bull_prev= (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc > pst) and (pc > pe)
+    bear_prev= (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc < pst) and (pc < pe)
 
     ts_last: datetime = df.index[idx_last]
     now_ist = datetime.now(IST)
 
+    # ENTRY checks (fresh flips)
+    crossed_to_bull = bull and (not bull_prev)
+    crossed_to_bear = bear and (not bear_prev)
+
+    # EXIT checks (regime ended)
+    ended_bull = bull_prev and (not bull)   # was bull, now not bull -> exit long put spread (stop)
+    ended_bear = bear_prev and (not bear)   # was bear, now not bear -> exit call spread (stop)
+
+    # EXIT & REVERSE (rare but possible exactly on flip)
+    if ended_bull and crossed_to_bear:
+        legs = suggested_option_legs("BEAR", c, now_ist)
+        return {
+            "status": "EXIT_AND_REVERSE",
+            "from_side": "BULLISH",
+            "to_side": "BEARISH",
+            "reason": "Trend flip",
+            "timestamp": ts_last.isoformat(),
+            "close": c, "ema20": e, "supertrend": st,
+            "entry_suggestion": legs
+        }
+    if ended_bear and crossed_to_bull:
+        legs = suggested_option_legs("BULL", c, now_ist)
+        return {
+            "status": "EXIT_AND_REVERSE",
+            "from_side": "BEARISH",
+            "to_side": "BULLISH",
+            "reason": "Trend flip",
+            "timestamp": ts_last.isoformat(),
+            "close": c, "ema20": e, "supertrend": st,
+            "entry_suggestion": legs
+        }
+
+    # Plain ENTRY
     if crossed_to_bull:
         legs = suggested_option_legs("BULL", c, now_ist)
-        return {"status":"SIGNAL","side":"BULLISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
+        return {"status":"ENTRY","side":"BULLISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
     if crossed_to_bear:
         legs = suggested_option_legs("BEAR", c, now_ist)
-        return {"status":"SIGNAL","side":"BEARISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
+        return {"status":"ENTRY","side":"BEARISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
 
+    # Plain EXIT (stoploss) without immediate reverse
+    if ended_bull:
+        return {"status":"EXIT","from_side":"BULLISH","reason":"Trend flip","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st}
+    if ended_bear:
+        return {"status":"EXIT","from_side":"BEARISH","reason":"Trend flip","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st}
+
+    # Neither entry nor exit
     return {"status":"NO_SIGNAL","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st}
 
 # ---------------- Telegram ----------------
@@ -291,19 +336,41 @@ def send_telegram(text: str) -> None:
     else:
         log("Telegram sent.")
 
-def fmt_signal_text(sig: dict) -> str:
-    if sig.get("status")!="SIGNAL": return ""
+def fmt_entry_text(sig: dict) -> str:
     ts_ist = datetime.fromisoformat(sig["timestamp"]).astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
     legs = sig["option_legs"]
     return (
-        f"📈 NIFTY Hourly Signal ({ts_ist})\n"
+        f"✅ ENTRY — NIFTY ({ts_ist})\n"
         f"Side: {sig['side']}\n"
         f"Close: {sig['close']:.2f} | ST: {sig['supertrend']:.2f} | EMA20: {sig['ema20']:.2f}\n"
         f"Suggested ({legs['expiry_type']}):\n"
         f"Expiry: {legs['expiry']}\n"
         f" • SELL {legs['sell']}\n"
         f" • BUY  {legs['buy']}\n"
-        f"Exit if Supertrend flips or by Tue midday."
+        f"Exit on Supertrend flip or by Tue midday."
+    )
+
+def fmt_exit_text(sig: dict) -> str:
+    ts_ist = datetime.fromisoformat(sig["timestamp"]).astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+    return (
+        f"🛑 EXIT — NIFTY ({ts_ist})\n"
+        f"From: {sig['from_side']} | Reason: {sig.get('reason','Trend flip')}\n"
+        f"Close: {sig['close']:.2f} | ST: {sig['supertrend']:.2f} | EMA20: {sig['ema20']:.2f}\n"
+        f"Action: Close existing position."
+    )
+
+def fmt_exit_and_reverse_text(sig: dict) -> str:
+    ts_ist = datetime.fromisoformat(sig["timestamp"]).astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+    legs = sig["entry_suggestion"]
+    return (
+        f"🔁 EXIT & REVERSE — NIFTY ({ts_ist})\n"
+        f"Exit From: {sig['from_side']} → New: {sig['to_side']} (Reason: {sig.get('reason','Trend flip')})\n"
+        f"Close: {sig['close']:.2f} | ST: {sig['supertrend']:.2f} | EMA20: {sig['ema20']:.2f}\n"
+        f"New ({legs['expiry_type']}):\n"
+        f"Expiry: {legs['expiry']}\n"
+        f" • SELL {legs['sell']}\n"
+        f" • BUY  {legs['buy']}\n"
+        f"Manage as usual; exit on next flip."
     )
 
 # ---------------- CLI / Main ----------------
@@ -332,14 +399,19 @@ def main(argv=None):
         df = compute_indicators(df)
         df = _force_float_cols(df, ["EMA20","ST"])
 
-        sig = evaluate_signal(df)
+        sig = evaluate_with_exit(df)
         print(json.dumps(sig, indent=2))
 
-        if sig.get("status")=="SIGNAL":
-            msg = fmt_signal_text(sig)
-            log(msg); send_telegram(msg)
+        # routing
+        st = sig.get("status")
+        if st == "ENTRY":
+            msg = fmt_entry_text(sig); log(msg); send_telegram(msg)
+        elif st == "EXIT":
+            msg = fmt_exit_text(sig); log(msg); send_telegram(msg)
+        elif st == "EXIT_AND_REVERSE":
+            msg = fmt_exit_and_reverse_text(sig); log(msg); send_telegram(msg)
         else:
-            log(f"No new signal. Status: {sig['status']}")
+            log(f"No new trade event. Status: {st}")
     except Exception as e:
         log("ERROR: "+repr(e)); traceback.print_exc(); raise
 
