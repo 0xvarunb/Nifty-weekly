@@ -5,66 +5,71 @@ def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 def _atr(df: pd.DataFrame, period: int = 7) -> pd.Series:
-    """Wilder ATR (EMA of True Range)."""
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
+    """Wilder-style ATR using EMA of True Range."""
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
     prev_close = close.shift(1)
 
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr1 = (high - low).abs()
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
+    # Wilder’s smoothing == EMA with alpha=1/period
     atr = tr.ewm(alpha=1/period, adjust=False).mean()
     return atr
 
 def supertrend(df: pd.DataFrame, period: int = 7, multiplier: float = 3.5) -> pd.DataFrame:
     """
-    Returns DataFrame with:
-      ST      - supertrend line
-      ST_DIR  - +1 uptrend, -1 downtrend
+    Vectorized Supertrend.
+    Returns:
+      ST      : supertrend line
+      ST_DIR  : +1 uptrend, -1 downtrend
     """
-    hl2 = (df["High"] + df["Low"]) / 2.0
-    atr = _atr(df, period)
+    # Ensure float dtypes
+    high = df["High"].astype(float).to_numpy()
+    low  = df["Low"].astype(float).to_numpy()
+    close= df["Close"].astype(float).to_numpy()
+
+    atr = _atr(df, period).to_numpy()
+    hl2 = (high + low) / 2.0
 
     upperband = hl2 + multiplier * atr
     lowerband = hl2 - multiplier * atr
 
-    # Final bands
-    final_upper = upperband.copy()
-    final_lower = lowerband.copy()
+    n = len(df)
+    final_upper = np.copy(upperband)
+    final_lower = np.copy(lowerband)
 
-    for i in range(1, len(df)):
-        # if close prev <= final_upper prev, take min(current upper, final_upper prev)
-        if df["Close"].iat[i-1] <= final_upper.iat[i-1]:
-            final_upper.iat[i] = min(upperband.iat[i], final_upper.iat[i-1])
+    # Refine bands (carry-forward min/max logic)
+    for i in range(1, n):
+        if close[i-1] <= final_upper[i-1]:
+            final_upper[i] = min(upperband[i], final_upper[i-1])
         else:
-            final_upper.iat[i] = upperband.iat[i]
-        # if close prev >= final_lower prev, take max(current lower, final_lower prev)
-        if df["Close"].iat[i-1] >= final_lower.iat[i-1]:
-            final_lower.iat[i] = max(lowerband.iat[i], final_lower.iat[i-1])
+            final_upper[i] = upperband[i]
+
+        if close[i-1] >= final_lower[i-1]:
+            final_lower[i] = max(lowerband[i], final_lower[i-1])
         else:
-            final_lower.iat[i] = lowerband.iat[i]
+            final_lower[i] = lowerband[i]
 
-    st = pd.Series(index=df.index, dtype="float64")
-    dir_ = pd.Series(index=df.index, dtype="int64")
+    st = np.zeros(n, dtype=float)
+    direction = np.zeros(n, dtype=int)
 
-    for i in range(len(df)):
-        if df["Close"].iat[i] > final_upper.iat[i]:
-            st.iat[i] = final_lower.iat[i]
-            dir_.iat[i] = 1  # uptrend
-        elif df["Close"].iat[i] < final_lower.iat[i]:
-            st.iat[i] = final_upper.iat[i]
-            dir_.iat[i] = -1 # downtrend
+    # Initialize
+    st[0] = final_lower[0]
+    direction[0] = 1  # start as up unless broken in next step
+
+    for i in range(1, n):
+        if close[i] > final_upper[i]:
+            direction[i] = 1
+            st[i] = final_lower[i]
+        elif close[i] < final_lower[i]:
+            direction[i] = -1
+            st[i] = final_upper[i]
         else:
-            # keep prior direction if inside bands
-            if i == 0:
-                st.iat[i] = final_lower.iat[i]
-                dir_.iat[i] = 1
-            else:
-                st.iat[i] = st.iat[i-1]
-                dir_.iat[i] = dir_.iat[i-1]
+            direction[i] = direction[i-1]
+            st[i] = st[i-1]
 
-    return pd.DataFrame({"ST": st, "ST_DIR": dir_})
+    return pd.DataFrame({"ST": st, "ST_DIR": direction}, index=df.index)
