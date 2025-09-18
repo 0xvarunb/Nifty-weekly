@@ -2,13 +2,15 @@ import pandas as pd
 import numpy as np
 
 def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+    # Ensure numeric
+    s = pd.to_numeric(series, errors="coerce").astype("float64")
+    return s.ewm(span=period, adjust=False).mean().astype("float64")
 
 def _atr(df: pd.DataFrame, period: int = 7) -> pd.Series:
     """Wilder-style ATR via EMA of True Range."""
-    high = df["High"].astype(float)
-    low  = df["Low"].astype(float)
-    close= df["Close"].astype(float)
+    high = pd.to_numeric(df["High"], errors="coerce").astype("float64")
+    low  = pd.to_numeric(df["Low"],  errors="coerce").astype("float64")
+    close= pd.to_numeric(df["Close"],errors="coerce").astype("float64")
     prev_close = close.shift(1)
 
     tr = pd.concat([
@@ -17,19 +19,19 @@ def _atr(df: pd.DataFrame, period: int = 7) -> pd.Series:
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
 
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    atr = tr.ewm(alpha=1/period, adjust=False).mean().astype("float64")
     return atr
 
 def supertrend(df: pd.DataFrame, period: int = 7, multiplier: float = 3.5) -> pd.DataFrame:
     """
-    Vectorized Supertrend.
-    Returns DataFrame with:
-      ST      - supertrend line
-      ST_DIR  - +1 uptrend, -1 downtrend
+    Vectorized, stable Supertrend.
+    Returns:
+      ST      - float64 supertrend line
+      ST_DIR  - int64 (+1 uptrend, -1 downtrend)
     """
-    high = df["High"].astype(float).to_numpy()
-    low  = df["Low"].astype(float).to_numpy()
-    close= df["Close"].astype(float).to_numpy()
+    high = pd.to_numeric(df["High"], errors="coerce").astype("float64").to_numpy()
+    low  = pd.to_numeric(df["Low"],  errors="coerce").astype("float64").to_numpy()
+    close= pd.to_numeric(df["Close"],errors="coerce").astype("float64").to_numpy()
 
     atr = _atr(df, period).to_numpy()
     hl2 = (high + low) / 2.0
@@ -37,7 +39,7 @@ def supertrend(df: pd.DataFrame, period: int = 7, multiplier: float = 3.5) -> pd
     upperband = hl2 + multiplier * atr
     lowerband = hl2 - multiplier * atr
 
-    n = len(df)
+    n = len(close)
     final_upper = np.copy(upperband)
     final_lower = np.copy(lowerband)
 
@@ -46,9 +48,10 @@ def supertrend(df: pd.DataFrame, period: int = 7, multiplier: float = 3.5) -> pd
         final_upper[i] = min(upperband[i], final_upper[i-1]) if close[i-1] <= final_upper[i-1] else upperband[i]
         final_lower[i] = max(lowerband[i], final_lower[i-1]) if close[i-1] >= final_lower[i-1] else lowerband[i]
 
-    st = np.zeros(n, dtype=float)
-    direction = np.zeros(n, dtype=int)
+    st = np.zeros(n, dtype=np.float64)
+    direction = np.zeros(n, dtype=np.int64)
 
+    # init
     st[0] = final_lower[0]
     direction[0] = 1
 
