@@ -3,9 +3,9 @@ name: Nifty Hourly Scanner
 on:
   workflow_dispatch: {}
   schedule:
-    # Run shortly after each hourly close (IST) during market days (Mon-Fri)
-    # Hourly closes in IST around 10:15, 11:15, 12:15, 13:15, 14:15, 15:15
-    # Convert to UTC (IST - 5:30): 04:45..09:45 -> we trigger at :50 for safety.
+    # Runs shortly after each likely hourly close (IST) Mon–Fri.
+    # NSE hourly bars often complete around :15 (10:15..15:15 IST).
+    # Convert IST to UTC (IST-5:30). We trigger at :50 for safety.
     - cron: "50 4 * * 1-5"
     - cron: "50 5 * * 1-5"
     - cron: "50 6 * * 1-5"
@@ -38,6 +38,7 @@ jobs:
           ST_ATR_PERIOD: "7"
           ST_MULTIPLIER: "3.5"
           OTM_GAP_POINTS: "100"
+          ATM_STEP_POINTS: "50"
           LOG_LEVEL: "INFO"
           # Telegram secrets (set these in repo → Settings → Secrets → Actions)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
