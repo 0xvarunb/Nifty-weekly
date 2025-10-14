@@ -34,7 +34,7 @@ EMA_PERIOD        = int(os.getenv("EMA_PERIOD", "20"))
 ST_ATR_PERIOD     = int(os.getenv("ST_ATR_PERIOD", "7"))
 ST_MULTIPLIER     = float(os.getenv("ST_MULTIPLIER", "3.5"))
 
-OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "100"))   # hedge gap suggestion
+OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "150"))   # hedge gap suggestion
 ATM_STEP_POINTS   = int(os.getenv("ATM_STEP_POINTS", "50"))    # NIFTY=50, BANKNIFTY=100
 
 # Expiry weekday (NSE: Tuesday). Accepts "TUE" or int 0..6 (Mon..Sun)
