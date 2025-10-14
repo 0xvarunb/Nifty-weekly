@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-NIFTY hourly scanner for Supertrend + EMA(20) with ENTRY + EXIT (stoploss) alerts.
+NIFTY hourly scanner — Supertrend + EMA(20)
+(Stable entry-only version + widened gate + diagnostics)
 
-Signals (evaluated on the latest completed hourly candle, IST):
-- Bullish  = Close > Supertrend AND Close > EMA20
-- Bearish  = Close < Supertrend AND Close < EMA20
-ENTRY alerts fire only on a NEW flip into bull/bear.
-EXIT (stoploss) alerts fire when an existing regime ENDS (Supertrend flip).
+Signal rules (evaluated on the latest completed hourly candle, IST):
+- BULLISH  = Close > Supertrend AND Close > EMA20
+- BEARISH  = Close < Supertrend AND Close < EMA20
+Alerts trigger only on a NEW flip into bull/bear.
 
-Outputs JSON and (optionally) sends a Telegram alert with:
-- Side, Close, Supertrend, EMA20
-- Suggested option legs (ATM sell + OTM hedge)
-- Next expiry (Tue-based weekly; monthly = last Tue)
-- Clear labels for ENTRY, EXIT, and EXIT & REVERSE.
+Extras:
+- `--ping` sends a Telegram test message and exits
+- `HEARTBEAT=1` sends a short "alive" ping (used by heartbeat workflow)
+- Wider close window (minute 05..30) to avoid missing valid Yahoo bars
+- One-line diagnostics (enable with LOG_LEVEL=DEBUG)
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import requests
 import yfinance as yf
 
 # ---------------- Config ----------------
-TICKER            = os.getenv("NIFTY_TICKER", "^NSEI")   # Yahoo NIFTY 50 index
+TICKER            = os.getenv("NIFTY_TICKER", "^NSEI")   # Yahoo NIFTY50 index
 INTERVAL          = "60m"
 LOOKBACK_DAYS     = int(os.getenv("LOOKBACK_DAYS", "60"))
 
@@ -34,17 +34,23 @@ EMA_PERIOD        = int(os.getenv("EMA_PERIOD", "20"))
 ST_ATR_PERIOD     = int(os.getenv("ST_ATR_PERIOD", "7"))
 ST_MULTIPLIER     = float(os.getenv("ST_MULTIPLIER", "3.5"))
 
-OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "100"))   # hedge distance suggestion
+OTM_GAP_POINTS    = int(os.getenv("OTM_GAP_POINTS", "100"))   # hedge gap suggestion
 ATM_STEP_POINTS   = int(os.getenv("ATM_STEP_POINTS", "50"))    # NIFTY=50, BANKNIFTY=100
 
-# Expiry weekday (NSE change: Tuesday). Accepts strings like "TUE" or ints 0..6 (Mon..Sun)
+# Expiry weekday (NSE: Tuesday). Accepts "TUE" or int 0..6 (Mon..Sun)
 EXPIRY_WEEKDAY    = os.getenv("EXPIRY_WEEKDAY", "TUE")
+
+# Widened close window (minutes) & freshness
+CLOSE_MINUTE_MIN  = int(os.getenv("CLOSE_MINUTE_MIN", "5"))    # was 10
+CLOSE_MINUTE_MAX  = int(os.getenv("CLOSE_MINUTE_MAX", "30"))   # was 20
+STALE_HOURS       = float(os.getenv("STALE_HOURS", "8"))       # was 6
+
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO")
 
-# Heartbeat toggle (optional)
+# Heartbeat toggle (optional): if "1", send "alive" ping and exit
 HEARTBEAT         = os.getenv("HEARTBEAT", "0") == "1"
 
-# Telegram
+# Telegram (optional)
 TG_TOKEN          = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM     = bool(TG_TOKEN and TG_CHAT_ID)
@@ -59,15 +65,13 @@ def log(msg: str):
 def _weekday_to_int(w: str | int) -> int:
     if isinstance(w, int):
         return max(0, min(6, w))
-    m = {
-        "mon":0,"monday":0,"0":0,
-        "tue":1,"tuesday":1,"1":1,
-        "wed":2,"wednesday":2,"2":2,
-        "thu":3,"thursday":3,"3":3,
-        "fri":4,"friday":4,"4":4,
-        "sat":5,"saturday":5,"5":5,
-        "sun":6,"sunday":6,"6":6
-    }
+    m = {"mon":0,"monday":0,"0":0,
+         "tue":1,"tuesday":1,"1":1,
+         "wed":2,"wednesday":2,"2":2,
+         "thu":3,"thursday":3,"3":3,
+         "fri":4,"friday":4,"4":4,
+         "sat":5,"saturday":5,"5":5,
+         "sun":6,"sunday":6,"6":6}
     return m.get(str(w).strip().lower(), 1)
 
 EXPIRY_WD_INT = _weekday_to_int(EXPIRY_WEEKDAY)
@@ -84,6 +88,10 @@ def is_monthly_expiry(d: date, weekday_int: int) -> bool:
     return d == last_weekday_of_month(d.year, d.month, weekday_int)
 
 def next_weekly_expiry_ist(now_ist: datetime) -> tuple[str, str]:
+    """
+    Return (expiry_date_str, expiry_type_str) where expiry_type_str ∈ {"Weekly", "Monthly"}.
+    If it's expiry day and AFTER 15:30 IST, roll to next week.
+    """
     dow = now_ist.weekday()
     days_ahead = (EXPIRY_WD_INT - dow) % 7
     candidate = (now_ist + timedelta(days=days_ahead)).date()
@@ -92,72 +100,23 @@ def next_weekly_expiry_ist(now_ist: datetime) -> tuple[str, str]:
     exp_type = "Monthly" if is_monthly_expiry(candidate, EXPIRY_WD_INT) else "Weekly"
     return str(candidate), exp_type
 
-# ---------------- Option legs ----------------
 def suggested_option_legs(side: str, spot: float, now_ist: datetime) -> dict:
+    """
+    Bullish -> Sell ATM PE, Buy OTM PE
+    Bearish -> Sell ATM CE, Buy OTM CE
+    Includes expiry (Tue) + label Weekly/Monthly.
+    """
     atm = round_to_step(spot, ATM_STEP_POINTS)
-    if side=="BULL":
-        legs = {"sell": f"{atm} PE (ATM)", "buy": f"{max(ATM_STEP_POINTS, atm-OTM_GAP_POINTS)} PE (hedge ~{OTM_GAP_POINTS})"}
+    if side == "BULL":
+        legs = {"sell": f"{atm} PE (ATM)", "buy": f"{max(ATM_STEP_POINTS, atm - OTM_GAP_POINTS)} PE (hedge ~{OTM_GAP_POINTS})"}
     else:
-        legs = {"sell": f"{atm} CE (ATM)", "buy": f"{atm+OTM_GAP_POINTS} CE (hedge ~{OTM_GAP_POINTS})"}
+        legs = {"sell": f"{atm} CE (ATM)", "buy": f"{atm + OTM_GAP_POINTS} CE (hedge ~{OTM_GAP_POINTS})"}
     expiry_str, exp_type = next_weekly_expiry_ist(now_ist)
-    legs["expiry"], legs["expiry_type"] = expiry_str, exp_type
+    legs["expiry"] = expiry_str
+    legs["expiry_type"] = exp_type
     return legs
 
-# ---------------- Data utils ----------------
-def _force_float_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
-    return df
-
-def _flatten_if_multiindex(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df.columns, pd.MultiIndex):
-        return df
-    # try select by ticker on any level
-    try:
-        for lvl in range(df.columns.nlevels):
-            if TICKER in df.columns.get_level_values(lvl):
-                return df.xs(TICKER, axis=1, level=lvl, drop_level=True)
-    except Exception:
-        pass
-    # fallback to first key on last level
-    try:
-        key = df.columns.get_level_values(-1)[0]
-        return df.xs(key, axis=1, level=-1, drop_level=True)
-    except Exception:
-        # ultimate flatten
-        df.columns = ["|".join([str(x) for x in tup if x is not None]) for tup in df.columns.to_list()]
-        ren = {}
-        for col in df.columns:
-            low = col.lower()
-            if "open" in low and "Open" not in ren.values(): ren[col]="Open"
-            elif "high" in low and "High" not in ren.values(): ren[col]="High"
-            elif "low" in low and "Low" not in ren.values(): ren[col]="Low"
-            elif "adj" in low and "close" in low and "Adj Close" not in ren.values(): ren[col]="Adj Close"
-            elif "close" in low and "Close" not in ren.values(): ren[col]="Close"
-            elif "volume" in low and "Volume" not in ren.values(): ren[col]="Volume"
-        return df.rename(columns=ren)
-
-def fetch_hourly() -> pd.DataFrame:
-    try:
-        df = yf.Ticker(TICKER).history(period=f"{LOOKBACK_DAYS}d", interval=INTERVAL, auto_adjust=False)
-    except Exception:
-        df = None
-    if df is None or df.empty:
-        end = datetime.now(timezone.utc); start = end - timedelta(days=LOOKBACK_DAYS)
-        df = yf.download(TICKER, start=start, end=end, interval=INTERVAL, auto_adjust=False, progress=False, group_by="column")
-    if df is None or df.empty:
-        raise RuntimeError("No data returned from yfinance.")
-    if df.index.tz is None:
-        df.index = df.index.tz_localize(timezone.utc)
-    df = df.tz_convert(IST)
-    df = _flatten_if_multiindex(df)
-    for n in ["Open","High","Low","Close"]:
-        if n not in df.columns:
-            raise RuntimeError(f"Missing '{n}' after fetch; cols={list(df.columns)}")
-    return _force_float_cols(df, ["Open","High","Low","Close","Adj Close","Volume"])
-
-# ---------------- Indicators ----------------
+# ---------------- Indicators (self-contained) ----------------
 def ema(series: pd.Series, period: int) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").astype("float64")
     return s.ewm(span=period, adjust=False).mean().astype("float64")
@@ -208,25 +167,83 @@ def supertrend(df: pd.DataFrame, period: int = 7, multiplier: float = 3.5) -> pd
             dir_[i] = dir_[i-1]; st[i] = st[i-1]
     return pd.DataFrame({"ST": st, "ST_DIR": dir_}, index=df.index)
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["EMA20"] = ema(out["Close"], EMA_PERIOD).astype("float64")
-    st = supertrend(out, period=ST_ATR_PERIOD, multiplier=ST_MULTIPLIER)
-    out["ST"] = pd.to_numeric(st["ST"], errors="coerce").astype("float64")
-    out["ST_DIR"] = pd.to_numeric(st["ST_DIR"], errors="coerce").astype("int64")
-    return out
+# ---------------- Data fetch ----------------
+def _flatten_if_multiindex(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    # try selecting by ticker on any level
+    try:
+        for lvl in range(df.columns.nlevels):
+            if TICKER in df.columns.get_level_values(lvl):
+                return df.xs(TICKER, axis=1, level=lvl, drop_level=True)
+    except Exception:
+        pass
+    # fallback: use first key on last level
+    try:
+        key = df.columns.get_level_values(-1)[0]
+        return df.xs(key, axis=1, level=-1, drop_level=True)
+    except Exception:
+        # last resort: flatten names heuristically
+        df.columns = ["|".join([str(x) for x in tup if x is not None]) for tup in df.columns.to_list()]
+        rename_map = {}
+        for col in df.columns:
+            low = col.lower()
+            if "open" in low and "Open" not in rename_map.values():   rename_map[col] = "Open"
+            elif "high" in low and "High" not in rename_map.values(): rename_map[col] = "High"
+            elif "low" in low and "Low" not in rename_map.values():   rename_map[col] = "Low"
+            elif "adj" in low and "close" in low and "Adj Close" not in rename_map.values(): rename_map[col] = "Adj Close"
+            elif "close" in low and "Close" not in rename_map.values(): rename_map[col] = "Close"
+            elif "volume" in low and "Volume" not in rename_map.values(): rename_map[col] = "Volume"
+        return df.rename(columns=rename_map)
 
-# ---------------- Signal logic (with EXIT) ----------------
+def _force_float_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    return df
+
+def fetch_hourly() -> pd.DataFrame:
+    # Prefer history(); fallback to download()
+    try:
+        df = yf.Ticker(TICKER).history(period=f"{LOOKBACK_DAYS}d", interval=INTERVAL, auto_adjust=False)
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        end = datetime.now(timezone.utc); start = end - timedelta(days=LOOKBACK_DAYS)
+        df = yf.download(TICKER, start=start, end=end, interval=INTERVAL, auto_adjust=False, progress=False, group_by="column")
+    if df is None or df.empty:
+        raise RuntimeError("No data returned from yfinance.")
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(timezone.utc)
+    df = df.tz_convert(IST)
+    df = _flatten_if_multiindex(df)
+    for n in ["Open","High","Low","Close"]:
+        if n not in df.columns:
+            raise RuntimeError(f"Missing column '{n}' after fetch; columns={list(df.columns)}")
+    return _force_float_cols(df, ["Open","High","Low","Close","Adj Close","Volume"])
+
+# ---------------- Signal logic (entry alerts only) ----------------
 def latest_hourly_close_row_index(df: pd.DataFrame) -> int | None:
-    idx_last = len(df)-1
+    """
+    Accept a bar that looks like today's hourly close.
+    Now uses a wider minute window [CLOSE_MINUTE_MIN .. CLOSE_MINUTE_MAX] and staleness check.
+    """
+    idx_last = len(df) - 1
     ts_last: datetime = df.index[idx_last]
     now_ist = datetime.now(IST)
+
+    # debug breadcrumb
+    log(f"Last bar ts={ts_last}, minute={ts_last.minute}, now={now_ist.strftime('%H:%M')} IST")
+
     if ts_last.date() != now_ist.date():
-        log(f"Last bar {ts_last} not from today; skipping."); return None
-    if not (10 <= int(ts_last.minute) <= 20):
-        log(f"Last bar minute {ts_last.minute} not in 10..20; skipping (ts={ts_last})."); return None
-    if (now_ist - ts_last) > timedelta(hours=6):
-        log(f"Last bar {ts_last} stale (>6h); skipping."); return None
+        log(f"Last bar {ts_last} not from today; skipping.")
+        return None
+    if not (CLOSE_MINUTE_MIN <= int(ts_last.minute) <= CLOSE_MINUTE_MAX):
+        log(f"Last bar minute {ts_last.minute} not in {CLOSE_MINUTE_MIN}..{CLOSE_MINUTE_MAX}; skipping.")
+        return None
+    if (now_ist - ts_last) > timedelta(hours=STALE_HOURS):
+        log(f"Last bar {ts_last} stale (>{STALE_HOURS}h); skipping.")
+        return None
     return idx_last
 
 def _get_scalar(x) -> float:
@@ -235,21 +252,24 @@ def _get_scalar(x) -> float:
         if math.isnan(v): raise ValueError("NaN")
         return v
     except Exception:
-        raise ValueError("not scalar")
+        raise ValueError("not a scalar")
 
-def evaluate_with_exit(df: pd.DataFrame) -> dict:
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["EMA20"] = ema(out["Close"], EMA_PERIOD).astype("float64")
+    st = supertrend(out, period=ST_ATR_PERIOD, multiplier=ST_MULTIPLIER)
+    out["ST"] = pd.to_numeric(st["ST"], errors="coerce").astype("float64")
+    out["ST_DIR"] = pd.to_numeric(st["ST_DIR"], errors="coerce").astype("int64")
+    return out
+
+def evaluate_signal(df: pd.DataFrame) -> dict:
     """
-    Returns one of:
-      - {"status":"ENTRY", "side":"BULLISH"/"BEARISH", ...}
-      - {"status":"EXIT",  "from_side":"BULLISH"/"BEARISH", "reason":"Trend flip", ...}
-      - {"status":"EXIT_AND_REVERSE", "from_side":..., "to_side":..., "entry_suggestion":{legs}, ...}
-      - {"status":"NO_ACTION", ...} or {"status":"NO_SIGNAL", ...}
+    ENTRY alerts only (fresh flips). No EXIT/SL in this reverted version.
     """
     idx_last = latest_hourly_close_row_index(df)
     if idx_last is None:
         return {"status": "NO_ACTION"}
 
-    # current bar
     try:
         c  = _get_scalar(df["Close"].iat[idx_last])
         st = _get_scalar(df["ST"].iat[idx_last])
@@ -257,78 +277,44 @@ def evaluate_with_exit(df: pd.DataFrame) -> dict:
     except ValueError:
         return {"status": "NO_ACTION"}
 
-    # previous bar
-    pc = pst = pe = np.nan
-    if idx_last >= 1:
+    pc=pst=pe=np.nan
+    if idx_last>=1:
         try:
             pc  = _get_scalar(df["Close"].iat[idx_last-1])
             pst = _get_scalar(df["ST"].iat[idx_last-1])
             pe  = _get_scalar(df["EMA20"].iat[idx_last-1])
         except ValueError:
-            pc = pst = pe = np.nan
+            pc=pst=pe=np.nan
 
-    # regimes
-    bull     = (c > st) and (c > e)
-    bear     = (c < st) and (c < e)
-    bull_prev= (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc > pst) and (pc > pe)
-    bear_prev= (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc < pst) and (pc < pe)
+    bull = (c > st) and (c > e)
+    bear = (c < st) and (c < e)
+    bull_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc > pst) and (pc > pe)
+    bear_prev = (not np.isnan(pc)) and (not np.isnan(pst)) and (not np.isnan(pe)) and (pc < pst) and (pc < pe)
+
+    # --- one-line diagnostics (always printed; richer when LOG_LEVEL=DEBUG) ---
+    log(f"Diag last: C={c:.2f} ST={st:.2f} EMA={e:.2f} | prev: C={pc:.2f} ST={pst:.2f} EMA={pe:.2f} | "
+        f"now(bull={bull}, bear={bear}) prev(bull={bull_prev}, bear={bear_prev})")
+
+    crossed_to_bull = bull and (not bull_prev)
+    crossed_to_bear = bear and (not bear_prev)
 
     ts_last: datetime = df.index[idx_last]
     now_ist = datetime.now(IST)
 
-    # ENTRY checks (fresh flips)
-    crossed_to_bull = bull and (not bull_prev)
-    crossed_to_bear = bear and (not bear_prev)
-
-    # EXIT checks (regime ended)
-    ended_bull = bull_prev and (not bull)   # was bull, now not bull -> exit long put spread (stop)
-    ended_bear = bear_prev and (not bear)   # was bear, now not bear -> exit call spread (stop)
-
-    # EXIT & REVERSE (rare but possible exactly on flip)
-    if ended_bull and crossed_to_bear:
-        legs = suggested_option_legs("BEAR", c, now_ist)
-        return {
-            "status": "EXIT_AND_REVERSE",
-            "from_side": "BULLISH",
-            "to_side": "BEARISH",
-            "reason": "Trend flip",
-            "timestamp": ts_last.isoformat(),
-            "close": c, "ema20": e, "supertrend": st,
-            "entry_suggestion": legs
-        }
-    if ended_bear and crossed_to_bull:
-        legs = suggested_option_legs("BULL", c, now_ist)
-        return {
-            "status": "EXIT_AND_REVERSE",
-            "from_side": "BEARISH",
-            "to_side": "BULLISH",
-            "reason": "Trend flip",
-            "timestamp": ts_last.isoformat(),
-            "close": c, "ema20": e, "supertrend": st,
-            "entry_suggestion": legs
-        }
-
-    # Plain ENTRY
     if crossed_to_bull:
         legs = suggested_option_legs("BULL", c, now_ist)
-        return {"status":"ENTRY","side":"BULLISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
+        return {"status":"SIGNAL","side":"BULLISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
     if crossed_to_bear:
         legs = suggested_option_legs("BEAR", c, now_ist)
-        return {"status":"ENTRY","side":"BEARISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
+        return {"status":"SIGNAL","side":"BEARISH","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st,"option_legs":legs}
 
-    # Plain EXIT (stoploss) without immediate reverse
-    if ended_bull:
-        return {"status":"EXIT","from_side":"BULLISH","reason":"Trend flip","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st}
-    if ended_bear:
-        return {"status":"EXIT","from_side":"BEARISH","reason":"Trend flip","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st}
-
-    # Neither entry nor exit
     return {"status":"NO_SIGNAL","timestamp":ts_last.isoformat(),"close":c,"ema20":e,"supertrend":st}
 
 # ---------------- Telegram ----------------
 def send_telegram(text: str) -> None:
     if not SEND_TELEGRAM:
-        log("Telegram disabled (missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)."); return
+        log("Telegram disabled (missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID).")
+        return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text})
     if r.status_code != 200:
@@ -336,41 +322,19 @@ def send_telegram(text: str) -> None:
     else:
         log("Telegram sent.")
 
-def fmt_entry_text(sig: dict) -> str:
+def fmt_signal_text(sig: dict) -> str:
+    if sig.get("status")!="SIGNAL": return ""
     ts_ist = datetime.fromisoformat(sig["timestamp"]).astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
     legs = sig["option_legs"]
     return (
-        f"✅ ENTRY — NIFTY ({ts_ist})\n"
+        f"📈 NIFTY Hourly Signal ({ts_ist})\n"
         f"Side: {sig['side']}\n"
         f"Close: {sig['close']:.2f} | ST: {sig['supertrend']:.2f} | EMA20: {sig['ema20']:.2f}\n"
         f"Suggested ({legs['expiry_type']}):\n"
         f"Expiry: {legs['expiry']}\n"
         f" • SELL {legs['sell']}\n"
         f" • BUY  {legs['buy']}\n"
-        f"Exit on Supertrend flip or by Tue midday."
-    )
-
-def fmt_exit_text(sig: dict) -> str:
-    ts_ist = datetime.fromisoformat(sig["timestamp"]).astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
-    return (
-        f"🛑 EXIT — NIFTY ({ts_ist})\n"
-        f"From: {sig['from_side']} | Reason: {sig.get('reason','Trend flip')}\n"
-        f"Close: {sig['close']:.2f} | ST: {sig['supertrend']:.2f} | EMA20: {sig['ema20']:.2f}\n"
-        f"Action: Close existing position."
-    )
-
-def fmt_exit_and_reverse_text(sig: dict) -> str:
-    ts_ist = datetime.fromisoformat(sig["timestamp"]).astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
-    legs = sig["entry_suggestion"]
-    return (
-        f"🔁 EXIT & REVERSE — NIFTY ({ts_ist})\n"
-        f"Exit From: {sig['from_side']} → New: {sig['to_side']} (Reason: {sig.get('reason','Trend flip')})\n"
-        f"Close: {sig['close']:.2f} | ST: {sig['supertrend']:.2f} | EMA20: {sig['ema20']:.2f}\n"
-        f"New ({legs['expiry_type']}):\n"
-        f"Expiry: {legs['expiry']}\n"
-        f" • SELL {legs['sell']}\n"
-        f" • BUY  {legs['buy']}\n"
-        f"Manage as usual; exit on next flip."
+        f"Exit if Supertrend flips or by Tue midday."
     )
 
 # ---------------- CLI / Main ----------------
@@ -399,19 +363,14 @@ def main(argv=None):
         df = compute_indicators(df)
         df = _force_float_cols(df, ["EMA20","ST"])
 
-        sig = evaluate_with_exit(df)
+        sig = evaluate_signal(df)
         print(json.dumps(sig, indent=2))
 
-        # routing
-        st = sig.get("status")
-        if st == "ENTRY":
-            msg = fmt_entry_text(sig); log(msg); send_telegram(msg)
-        elif st == "EXIT":
-            msg = fmt_exit_text(sig); log(msg); send_telegram(msg)
-        elif st == "EXIT_AND_REVERSE":
-            msg = fmt_exit_and_reverse_text(sig); log(msg); send_telegram(msg)
+        if sig.get("status")=="SIGNAL":
+            msg = fmt_signal_text(sig)
+            log(msg); send_telegram(msg)
         else:
-            log(f"No new trade event. Status: {st}")
+            log(f"No new signal. Status: {sig['status']}")
     except Exception as e:
         log("ERROR: "+repr(e)); traceback.print_exc(); raise
 
